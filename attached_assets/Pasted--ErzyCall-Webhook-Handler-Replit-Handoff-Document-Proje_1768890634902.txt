@@ -1,0 +1,356 @@
+# ErzyCall Webhook Handler - Replit Handoff Document
+
+## Project Overview
+
+Build a Node.js webhook handler that receives Vapi AI call completion webhooks and:
+1. Determines the call outcome based on transcript/summary analysis
+2. Sends a formatted Telegram notification
+3. Updates the lead's record in Attio CRM
+
+---
+
+## System Context
+
+### What is ErzyCall?
+ErzyCall is a Malaysian company that provides AI phone answering services. They use:
+- **Vapi** - AI voice agent that makes outbound sales calls
+- **Attio** - CRM to store lead information
+- **Telegram** - For real-time notifications to the sales team
+- **Make.com** - Currently triggers calls (Scenario 2), but webhook handling is moving to this code
+
+### Current Flow
+1. Lead comes in (from Facebook/Google Sheets)
+2. Lead is saved to Attio CRM
+3. Make.com Scenario 2 triggers Vapi to call the lead
+4. **Vapi calls the lead using AI agent "Maya"**
+5. **When call ends, Vapi sends webhook → THIS CODE HANDLES IT**
+6. Code determines outcome, notifies via Telegram, updates Attio
+
+---
+
+## API Credentials
+
+### Telegram Bot
+```
+Bot Token: 8526709791:AAE7J93BeUQmDCTq7aUhsnNV7OLdjM0skSw
+Chat ID: 28484990
+```
+
+### Attio CRM
+```
+API Key: 99ee262acf33631bdef5e66c65f9812670fb1b51065f470d652a2cc1756ad635
+API Base URL: https://api.attio.com/v2
+```
+
+### Vapi (for reference)
+```
+Assistant ID: 7e6aec66-2d12-4279-a1e0-52686ecc65b8
+Phone Number: +601546001006
+```
+
+---
+
+## Vapi Webhook Payload Structure
+
+Vapi sends `end-of-call-report` with this structure:
+
+```json
+{
+  "message": {
+    "type": "end-of-call-report",
+    "endedReason": "customer-ended-call",
+    "call": {
+      "id": "call_12345",
+      "duration": 180,
+      "customer": {
+        "number": "+60123456789"
+      },
+      "metadata": {
+        "attio_record_id": "4e244f73-a047-4f6a-a7e5-60700cf4fe38"
+      }
+    },
+    "artifact": {
+      "transcript": "AI: Hi, this is Maya from ErzyCall... User: Yes, I'm interested..."
+    },
+    "analysis": {
+      "summary": "Customer expressed interest in the AI phone service and asked about pricing."
+    }
+  }
+}
+```
+
+### Key Fields to Extract:
+| Field | Path | Description |
+|-------|------|-------------|
+| `type` | `message.type` | Must be `end-of-call-report` (ignore others) |
+| `callId` | `message.call.id` | Unique call identifier |
+| `customerPhone` | `message.call.customer.number` | Lead's phone number |
+| `duration` | `message.call.duration` | Call duration in seconds |
+| `endedReason` | `message.endedReason` | Why call ended |
+| `transcript` | `message.artifact.transcript` | Full conversation |
+| `summary` | `message.analysis.summary` | AI-generated summary |
+| `attioRecordId` | `message.call.metadata.attio_record_id` | Attio record to update |
+
+### Common `endedReason` Values:
+| Value | Meaning |
+|-------|---------|
+| `customer-ended-call` | Customer hung up |
+| `assistant-ended-call` | AI ended the call |
+| `customer-did-not-answer` | No answer |
+| `voicemail` | Reached voicemail |
+| `busy` | Line busy |
+| `failed` | Call failed |
+
+---
+
+## Call Outcome Logic
+
+Determine outcome based on this priority:
+
+### 1. No Answer Cases
+```
+IF endedReason IN ['customer-did-not-answer', 'no-answer', 'busy', 'failed']
+→ Outcome: "No Answer"
+```
+
+### 2. Voicemail
+```
+IF endedReason = 'voicemail' OR transcript contains 'voicemail'
+→ Outcome: "Voicemail"
+```
+
+### 3. Booked (Highest Priority for Answered Calls)
+```
+IF transcript/summary contains ('book' OR 'appointment' OR 'schedule')
+   AND contains positive confirmation ('yes', 'sure', 'okay', 'pm', 'am', time references)
+→ Outcome: "Booked"
+```
+
+### 4. Interested
+```
+IF transcript/summary contains 'interested' 
+   AND NOT contains 'not interested'
+→ Outcome: "Interested"
+```
+
+### 5. Not Interested
+```
+IF transcript/summary contains ('not interested' OR 'no thank' OR 'no, thank' OR 'not for me' OR 'don't call')
+→ Outcome: "Not Interested"
+```
+
+### 6. Duration-Based Fallback
+```
+IF duration > 60 seconds → "Interested"
+IF duration > 30 seconds → "Needs Review"
+ELSE → "Not Interested"
+```
+
+---
+
+## Telegram Message Format
+
+### Template by Outcome:
+
+**Booked:**
+```
+🎉 BOOKING CONFIRMED!
+
+📞 +60123456789
+⏱ Duration: 120s
+
+📝 Summary: Customer booked a demo call for tomorrow at 3pm.
+
+💬 WhatsApp: https://wa.me/60123456789?text=Hi,%20thank%20you%20for%20booking!
+```
+
+**Interested:**
+```
+🔥 INTERESTED LEAD!
+
+📞 +60123456789
+⏱ Duration: 90s
+
+📝 Summary: Customer asked about pricing and wants to know more.
+
+💬 WhatsApp: https://wa.me/60123456789?text=Hi,%20thanks%20for%20your%20interest!
+```
+
+**Not Interested:**
+```
+❌ Not Interested
+
+📞 +60123456789
+⏱ Duration: 45s
+
+📝 Summary: Customer said they are not looking for this service.
+```
+
+**No Answer:**
+```
+📵 No Answer
+
+📞 +60123456789
+
+💬 WhatsApp: https://wa.me/60123456789?text=Hi,%20we%20tried%20calling%20you.
+```
+
+**Voicemail:**
+```
+📫 Voicemail Left
+
+📞 +60123456789
+
+💬 WhatsApp: https://wa.me/60123456789?text=Hi,%20we%20left%20you%20a%20voicemail.
+```
+
+**Needs Review:**
+```
+⚠️ Call Completed - Review Needed
+
+📞 +60123456789
+⏱ Duration: 35s
+📊 Ended: customer-ended-call
+
+📝 Summary: [summary here]
+```
+
+---
+
+## Attio API Update
+
+### Endpoint:
+```
+PATCH https://api.attio.com/v2/objects/people/records/{attio_record_id}
+```
+
+### Headers:
+```
+Authorization: Bearer {ATTIO_API_KEY}
+Content-Type: application/json
+```
+
+### Body:
+```json
+{
+  "data": {
+    "values": {
+      "call_outcome": "Booked"
+    }
+  }
+}
+```
+
+### Note:
+- Only update if `attio_record_id` exists in webhook metadata
+- If missing, log warning but don't fail (manual calls won't have it)
+
+---
+
+## Endpoint Specification
+
+### POST `/webhook/vapi`
+Main webhook endpoint for Vapi callbacks.
+
+**Request:** Vapi webhook payload (see structure above)
+
+**Response:**
+```json
+{
+  "status": "success",
+  "outcome": "Interested",
+  "telegramSent": true,
+  "attioUpdated": true
+}
+```
+
+**Logic:**
+1. Validate `message.type === 'end-of-call-report'` (ignore others, return 200)
+2. Extract call data from payload
+3. Determine outcome using logic above
+4. Send Telegram notification
+5. Update Attio (if record ID exists)
+6. Return success response
+
+### GET `/`
+Health check endpoint.
+
+**Response:**
+```json
+{
+  "status": "ErzyCall Webhook Handler running!",
+  "version": "1.0.0"
+}
+```
+
+---
+
+## Error Handling
+
+1. **Invalid webhook type:** Return 200 with `{ status: 'ignored' }` (don't fail)
+2. **Telegram fails:** Log error, continue to Attio update
+3. **Attio fails:** Log error, still return success (notification was sent)
+4. **Missing attio_record_id:** Log warning, skip Attio update, still send Telegram
+
+---
+
+## Testing
+
+### Test with curl:
+```bash
+curl -X POST https://your-replit-url.repl.co/webhook/vapi \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": {
+      "type": "end-of-call-report",
+      "endedReason": "customer-ended-call",
+      "call": {
+        "id": "test-123",
+        "duration": 120,
+        "customer": { "number": "+60123456789" },
+        "metadata": { "attio_record_id": "test-record-id" }
+      },
+      "artifact": {
+        "transcript": "AI: Hi this is Maya. User: Yes I am interested in booking a demo."
+      },
+      "analysis": {
+        "summary": "Customer expressed interest and wants to book a demo."
+      }
+    }
+  }'
+```
+
+---
+
+## Deployment Checklist
+
+1. ✅ Create Node.js Replit project
+2. ✅ Add `index.js` with webhook handler
+3. ✅ Add `package.json` with express dependency
+4. ✅ Run and verify health check works
+5. ✅ Test with curl command above
+6. ✅ Update Vapi Assistant webhook URL to Replit URL + `/webhook/vapi`
+7. ✅ Make a real test call and verify:
+   - Telegram notification received
+   - Correct outcome determined
+   - Attio record updated (if triggered from Make.com Scenario 2)
+
+---
+
+## Files Structure
+
+```
+/
+├── index.js          # Main application code
+├── package.json      # Dependencies (express)
+└── .replit           # Replit config (auto-generated)
+```
+
+---
+
+## Future Improvements (Not Required Now)
+
+1. Add phone number lookup to Attio if `attio_record_id` is missing
+2. Add retry logic for failed API calls
+3. Add logging to external service (e.g., Logtail)
+4. Add environment variables for credentials (instead of hardcoded)
